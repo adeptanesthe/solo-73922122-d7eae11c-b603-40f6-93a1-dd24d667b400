@@ -10,7 +10,8 @@
 3. 丢序 -> /book 变 503 -> 自动重同步恢复；
 4. 断线 -> 503 -> 自动恢复；
 5. 延迟快照 + 断线 -> 恢复期间 503，最终恢复且序号不回退；
-6. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
+6. 短驻留大额挂单：行情源注入示例 -> 采集器 /events/short-dwell 记录完整字段；
+7. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
 """
 from __future__ import annotations
 
@@ -131,7 +132,29 @@ def main() -> int:
     st = col.get("/status").json()
     print(f"     stats: {st['stats']}")
 
-    print("== 6. 连续观察 5 秒 ==")
+    print("== 6. 短驻留大额挂单事件（注入示例 -> 采集器记录） ==")
+    check("演练后已恢复同步", wait_synced(col, 30))
+    r = src.post("/control/short_dwell", params={"side": "bid", "qty": 80, "dwell": 2})
+    check("触发短驻留示例", r.status_code == 200, f"got {r.status_code}")
+    injected = r.json()
+    time.sleep(4)  # 等剧本增量全部推送并入簿
+    r = col.get("/events/short-dwell")
+    check("事件查询返回 200", r.status_code == 200, f"got {r.status_code}")
+    payload = r.json()
+    check("响应带检测参数", payload["params"]["min_qty"] == 50 and payload["params"]["max_dwell"] == 3)
+    match = [e for e in payload["events"]
+             if e["price"] == injected["price"] and e["initial_qty"] == 80 and e["side"] == "bid"]
+    check("注入的短驻留挂单被记录", len(match) >= 1, f"price={injected['price']}")
+    if match:
+        e = match[0]
+        check("驻留时长在窗口内", 1 <= e["dwell"] <= 3, f"dwell={e['dwell']}")
+        check("起止序号连贯", e["end_seq"] > e["start_seq"],
+              f"{e['start_seq']} -> {e['end_seq']}")
+        check("事件带连接世代", e["generation"] >= 1, f"gen={e['generation']}")
+    r = col.get("/events/short-dwell", params={"limit": 1})
+    check("limit 生效", len(r.json()["events"]) <= 1)
+
+    print("== 7. 连续观察 5 秒 ==")
     end = time.monotonic() + 5
     while time.monotonic() < end:
         r = col.get("/book")

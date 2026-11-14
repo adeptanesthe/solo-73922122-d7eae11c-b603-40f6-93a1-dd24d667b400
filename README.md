@@ -44,6 +44,27 @@ python3 scripts/smoke_test.py     # 端到端冒烟
 6. **原子可见**：同一增量的多档变更先在副本上应用再整体交换，
    查询只能看到应用前或应用后的完整状态；`/book` 返回 `seq` + 买降序/卖升序盘口。
 
+## 短驻留大额挂单检测（collector/app/dwell_detector.py）
+
+供回测质控复核原始行情：自动识别“挂出即撤”的大额挂单，记录最近 100 条事件。
+
+- **事件定义**（同侧、同价位）：某条增量应用后，该价位从**无档**变为 `>=50` 手；
+  随后 **3 条增量内归零**（`qty=0`），且驻留期间**量未被改动**。
+- **按最终盘口判定**：同一条增量内的多次变更只算净效果，
+  “同条内先挂后撤”“同条内先小量后大量”都不能伪造或改写事件。
+- **快照已有档位不作起点**；快照在途期间缓冲的较新增量照常参与识别。
+- **重复增量不重复记录**；缺号/断流/重连时未闭合候选立即丢弃，
+  已确认事件保留且**绝不跨连接世代拼接**（每条事件带 `generation`）。
+- 事件字段：`side / price / start_seq / end_seq / dwell / initial_qty / generation`。
+
+查询：`GET /events/short-dwell?limit=100`（新的在前，失步期间历史事件仍可查）。
+触发示例（行情源注入一条买侧 80 手、驻留 2 条增量的挂单）：
+
+```bash
+curl -X POST 'http://localhost:8000/control/short_dwell?side=bid&qty=80&dwell=2'
+sleep 4 && curl 'http://localhost:8001/events/short-dwell'
+```
+
 ## 故障注入（行情源控制面，均可在 http://localhost:8000/docs 上直接调用）
 
 ```bash
@@ -52,6 +73,7 @@ curl -X POST 'http://localhost:8000/control/disconnect'           # 断线：关
 curl -X POST 'http://localhost:8000/control/snapshot_delay?seconds=5'  # 快照延迟 5s
 curl -X POST 'http://localhost:8000/control/duplicate'            # 重放上一条增量（测去重）
 curl -X POST 'http://localhost:8000/control/pause?seconds=3'      # 暂停推送（心跳继续）
+curl -X POST 'http://localhost:8000/control/short_dwell?side=bid&qty=80&dwell=2'  # 注入短驻留大挂单
 ```
 
 观察采集器行为：`watch curl -s localhost:8001/status`。
@@ -64,10 +86,11 @@ curl -X POST 'http://localhost:8000/control/pause?seconds=3'      # 暂停推送
 
 **采集器**（8001）
 - `GET /book` — 已同步：`{symbol, seq, bids, asks}`；失步：`503 {error, detail, last_error}`
-- `GET /status` — 同步状态、序号、世代、两侧档数、统计计数、配置
+- `GET /status` — 同步状态、序号、世代、两侧档数、统计计数、短驻留检测参数、配置
+- `GET /events/short-dwell?limit=100` — 最近 100 条短驻留大额挂单事件（新的在前，失步也可查）
 
 **行情源**（8000）
-- `GET /snapshot`、`WS /ws`、`GET /status`、`POST /control/*`（见上）
+- `GET /snapshot`、`WS /ws`、`GET /status`、`POST /control/*`（见上，含 `/control/short_dwell` 场景注入）
 
 ## 目录结构
 
@@ -75,11 +98,12 @@ curl -X POST 'http://localhost:8000/control/pause?seconds=3'      # 暂停推送
 ├── docker-compose.yml
 ├── collector/                 # 采集器
 │   ├── app/orderbook.py       #   订单簿 + 快照衔接（纯逻辑）
+│   ├── app/dwell_detector.py  #   短驻留大额挂单检测（纯逻辑）
 │   ├── app/sync_manager.py    #   WS/快照/世代管理/自愈循环
-│   ├── app/main.py            #   FastAPI: /book /status
-│   └── tests/                 #   pytest 单测（16 项）
-├── market_source/app/main.py  # 行情源 + 故障注入控制面
-└── scripts/smoke_test.py      # 端到端冒烟（丢序/断线/延迟快照/序号单调）
+│   ├── app/main.py            #   FastAPI: /book /status /events/short-dwell
+│   └── tests/                 #   pytest 单测（35 项）
+├── market_source/app/main.py  # 行情源 + 故障注入控制面 + 短驻留场景注入
+└── scripts/smoke_test.py      # 端到端冒烟（丢序/断线/延迟快照/短驻留事件/序号单调）
 ```
 
 ## 环境变量（采集器）
@@ -92,3 +116,6 @@ curl -X POST 'http://localhost:8000/control/pause?seconds=3'      # 暂停推送
 | `RECONNECT_DELAY` | `1.0` | 重同步间隔（秒） |
 | `DATA_TIMEOUT` | `5.0` | 收不到任何帧（含心跳）判定断流（秒） |
 | `SNAPSHOT_TIMEOUT` | `30.0` | 快照 HTTP 超时（需大于注入的快照延迟） |
+| `SHORT_DWELL_MIN_QTY` | `50` | 短驻留检测：大单阈值（手） |
+| `SHORT_DWELL_MAX_DWELL` | `3` | 短驻留检测：驻留窗口（增量条数） |
+| `SHORT_DWELL_EVENTS_CAPACITY` | `100` | 事件缓存容量（查询最多返回条数） |

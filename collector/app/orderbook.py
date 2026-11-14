@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -147,12 +148,15 @@ def build_synced_book(
     buffered: list[object],
     symbol: str,
     max_levels: int = 20,
+    on_applied: "Callable[[int, list[Change]], None] | None" = None,
 ) -> tuple[OrderBook, int, int]:
     """用快照 + 缓冲增量构建已同步订单簿。
 
     - 序号 <= 快照序号的缓冲增量（含重复）丢弃；
     - 之后的增量必须从 snapshot.seq + 1 开始逐条连续，恰好应用一次；
-    - 任一环节缺号即抛 GapError，由上层触发整轮重同步。
+    - 任一环节缺号即抛 GapError，由上层触发整轮重同步；
+    - on_applied 非空时，每条实际落簿的缓冲增量都会回调 (seq, changes)，
+      供短驻留检测器等旁路观察“快照在途期间的较新增量”。
 
     返回 (订单簿, 应用的增量条数, 丢弃的缓冲条数)。
     """
@@ -171,6 +175,8 @@ def build_synced_book(
         if seq != last + 1:
             raise GapError(f"increment gap after snapshot: expected seq {last + 1}, got {seq}")
         book.apply_increment(seq, changes)
+        if on_applied is not None:
+            on_applied(seq, changes)
         last = seq
         applied += 1
     return book, applied, dropped

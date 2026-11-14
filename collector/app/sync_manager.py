@@ -17,13 +17,16 @@ import httpx
 import websockets
 
 from .config import Settings
+from .dwell_detector import ShortDwellDetector
 from .orderbook import (
+    Change,
     GapError,
     OrderBook,
     ProtocolError,
     StaleSnapshotError,
     build_synced_book,
     validate_increment,
+    validate_snapshot,
 )
 
 log = logging.getLogger("collector.sync")
@@ -35,6 +38,12 @@ class SyncManager:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
         self.book = OrderBook(symbol=settings.symbol, max_levels=settings.max_levels)
+        # 短驻留大额挂单检测器：与订单簿吃同一批快照+增量，事件不跨世代拼接
+        self.detector = ShortDwellDetector(
+            min_qty=settings.short_dwell_min_qty,
+            max_dwell=settings.short_dwell_max_dwell,
+            capacity=settings.short_dwell_events_capacity,
+        )
         self.synced = False
         self.generation = 0  # 连接世代号，每轮恢复 +1
         self.lock = asyncio.Lock()  # 保护 book/synced，读写两侧都走它
@@ -79,6 +88,8 @@ class SyncManager:
             gen = self.generation
             async with self.lock:
                 self.synced = False
+                # 断流/缺号/重连：未闭合候选立即作废，绝不留到下一世代拼接
+                self.detector.abandon()
             try:
                 await self._cycle(gen)
             except asyncio.CancelledError:
@@ -180,9 +191,16 @@ class SyncManager:
         return data
 
     async def _install_snapshot(self, snapshot: dict, buffered: list[dict], gen: int) -> None:
+        # 记录快照在途期间实际落簿的缓冲增量，稍后喂给检测器（参与短驻留识别）
+        applied_log: list[tuple[int, list[Change]]] = []
         book, applied, dropped = build_synced_book(
-            snapshot, buffered, symbol=self.settings.symbol, max_levels=self.settings.max_levels
+            snapshot,
+            buffered,
+            symbol=self.settings.symbol,
+            max_levels=self.settings.max_levels,
+            on_applied=lambda seq, changes: applied_log.append((seq, changes)),
         )
+        snap_seq, snap_bids, snap_asks = validate_snapshot(snapshot, self.settings.symbol)
         async with self.lock:
             if gen != self.generation:
                 # 双重保险：安装前再核一次世代，迟到快照绝不覆盖新盘口
@@ -192,6 +210,10 @@ class SyncManager:
                 )
             self.book = book
             self.synced = True
+            # 检测器以快照为基线（已有档位不作起点），再按序重放较新的缓冲增量
+            self.detector.reset(snap_bids, snap_asks, snap_seq, gen)
+            for seq, changes in applied_log:
+                self.detector.observe(seq, changes)
             self.stats["snapshots_applied"] += 1
             self.stats["buffered_applied"] += applied
             self.stats["buffered_dropped"] += dropped
@@ -208,14 +230,35 @@ class SyncManager:
             last = self.book.seq
             if seq <= last:
                 self.stats["duplicates_skipped"] += 1
-                return  # 重复投递：恰好应用一次
+                return  # 重复投递：恰好应用一次，检测器也只见一次
             if seq != last + 1:
                 self.stats["gaps"] += 1
+                self.detector.abandon()  # 缺号：未闭合候选立即作废
                 raise GapError(f"increment gap: expected seq {last + 1}, got {seq}")
             self.book.apply_increment(seq, changes)
+            self.detector.observe(seq, changes)
             self.stats["increments_applied"] += 1
 
     # ---------- 查询视图 ----------
+
+    def short_dwell_view(self, limit: int) -> dict:
+        """最近 limit 条短驻留大额挂单事件（新的在前）；失步期间历史事件仍可查。"""
+        s = self.settings
+        events = self.detector.events(min(limit, s.short_dwell_events_capacity))
+        return {
+            "symbol": s.symbol,
+            "synced": self.synced,
+            "generation": self.generation,
+            "params": {
+                "min_qty": s.short_dwell_min_qty,
+                "max_dwell": s.short_dwell_max_dwell,
+                "capacity": s.short_dwell_events_capacity,
+            },
+            "confirmed_total": self.detector.confirmed_total,
+            "open_candidates": self.detector.open_candidates,
+            "count": len(events),
+            "events": [e.to_dict() for e in events],
+        }
 
     def status_view(self) -> dict:
         s = self.settings
@@ -227,6 +270,12 @@ class SyncManager:
             "levels": {"bids": len(self.book.bids), "asks": len(self.book.asks)},
             "last_error": self.last_error,
             "stats": dict(self.stats),
+            "short_dwell": {
+                "min_qty": s.short_dwell_min_qty,
+                "max_dwell": s.short_dwell_max_dwell,
+                "confirmed_total": self.detector.confirmed_total,
+                "open_candidates": self.detector.open_candidates,
+            },
             "source": {"http": s.source_http, "ws": s.source_ws},
             "config": {
                 "max_levels": s.max_levels,

@@ -21,6 +21,9 @@ services:
       RECONNECT_DELAY: "1.0"
       DATA_TIMEOUT: "5.0"
       SNAPSHOT_TIMEOUT: "30.0"
+      SHORT_DWELL_MIN_QTY: "50"        # 短驻留检测：大单阈值（手）
+      SHORT_DWELL_MAX_DWELL: "3"       # 短驻留检测：驻留窗口（增量条数）
+      SHORT_DWELL_EVENTS_CAPACITY: "100"  # 事件缓存容量（/events/short-dwell 最多返回条数）
     ports:
       - "8001:8000"   # 采集器：/book、/status、/docs
     depends_on:

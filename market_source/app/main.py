@@ -3,6 +3,7 @@
 - GET  /snapshot   全量快照：序号 + 完整买卖盘（可用 ?delay= 或控制面设置延迟）
 - WS   /ws         增量流：连续序号、多档变更、qty=0 删档；另有周期心跳
 - POST /control/*  故障注入：延迟快照、制造丢序、断线、重放重复增量、暂停推送
+- POST /control/short_dwell  场景注入：短驻留大额挂单（建大档 -> 驻留 -> 撤档）
 """
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ log = logging.getLogger("market-source")
 
 SYMBOL = "CU2601"
 MAX_LEVELS = 20
+SCRIPT_RESERVE = 4  # 随机行情预留的档位空位，保证剧本注入新档不触发采集器 max_levels 协议错误
 TICK = 10  # 最小价格变动，铜期货为 10 元/吨
 MID_PRICE = 70000
 
@@ -38,6 +40,7 @@ class MarketSource:
         self.tick_interval = 0.5       # 增量推送间隔（秒）
         self.paused_until = 0.0        # 暂停推送直到该 monotonic 时刻
         self.last_increment: dict | None = None
+        self.scripted: list[list[dict]] = []  # 剧本增量队列：每个元素是一条增量的 changes
         self._seed()
 
     def _seed(self) -> None:
@@ -58,26 +61,36 @@ class MarketSource:
         self.seq += 1 + self.pending_gap
         self.pending_gap = 0
 
-        changes = []
-        for _ in range(random.randint(1, 3)):
-            side = random.choice(("bid", "ask"))
-            book = self.bids if side == "bid" else self.asks
-            sign = -1 if side == "bid" else 1
-            slots = [self.mid + sign * TICK * (i + 1) for i in range(MAX_LEVELS)]
-            r = random.random()
-            if book and r < 0.20:
-                price, qty = random.choice(list(book)), 0      # 删档
-            elif len(book) >= MAX_LEVELS:
-                price = random.choice(list(book))              # 已满：改量
-                qty = random.randint(5, 100)
-            else:
-                price = random.choice(slots)                   # 新增或改量
-                qty = random.randint(5, 100)
-            if qty == 0:
-                book.pop(price, None)
-            else:
-                book[price] = qty
-            changes.append({"side": side, "price": price, "qty": qty})
+        if self.scripted:
+            # 剧本模式：整段增量受控、不掺随机变更，保证注入场景确定性复现
+            changes = self.scripted.pop(0)
+            for c in changes:
+                book = self.bids if c["side"] == "bid" else self.asks
+                if c["qty"] == 0:
+                    book.pop(c["price"], None)
+                else:
+                    book[c["price"]] = c["qty"]
+        else:
+            changes = []
+            for _ in range(random.randint(1, 3)):
+                side = random.choice(("bid", "ask"))
+                book = self.bids if side == "bid" else self.asks
+                sign = -1 if side == "bid" else 1
+                slots = [self.mid + sign * TICK * (i + 1) for i in range(MAX_LEVELS)]
+                r = random.random()
+                if book and r < 0.20:
+                    price, qty = random.choice(list(book)), 0      # 删档
+                elif len(book) >= MAX_LEVELS - SCRIPT_RESERVE:
+                    price = random.choice(list(book))              # 接近满档：改量（为剧本预留空位）
+                    qty = random.randint(5, 100)
+                else:
+                    price = random.choice(slots)                   # 新增或改量
+                    qty = random.randint(5, 100)
+                if qty == 0:
+                    book.pop(price, None)
+                else:
+                    book[price] = qty
+                changes.append({"side": side, "price": price, "qty": qty})
 
         inc = {"type": "increment", "symbol": self.symbol, "seq": self.seq, "changes": changes}
         self.last_increment = inc
@@ -138,7 +151,13 @@ async def index() -> dict:
     return {
         "service": app.title,
         "symbol": SYMBOL,
-        "links": {"snapshot": "/snapshot", "ws": "/ws", "status": "/status", "docs": "/docs"},
+        "links": {
+            "snapshot": "/snapshot",
+            "ws": "/ws",
+            "status": "/status",
+            "docs": "/docs",
+            "short_dwell": "POST /control/short_dwell",
+        },
     }
 
 
@@ -221,3 +240,38 @@ async def control_duplicate() -> dict:
 async def control_pause(seconds: float = 3.0) -> dict:
     source.paused_until = time.monotonic() + max(0.0, seconds)
     return {"ok": True, "paused_seconds": max(0.0, seconds)}
+
+
+@app.post(
+    "/control/short_dwell",
+    summary="注入短驻留大额挂单示例：建大档 -> 驻留 -> 撤档（供采集器 /events/short-dwell 复核）",
+)
+async def control_short_dwell(
+    side: str = Query(default="bid", description="bid/ask"),
+    qty: int = Query(default=80, description="挂单手数；>=50 才会被采集器默认阈值记录"),
+    dwell: int = Query(default=2, description="驻留的增量条数（1..10）；<=3 才会被记为短驻留"),
+) -> dict:
+    if side not in ("bid", "ask"):
+        return JSONResponse({"error": "bad_side", "detail": "side 只能是 bid/ask"}, status_code=400)
+    if not 1 <= qty <= 100000:
+        return JSONResponse({"error": "bad_qty", "detail": "qty 需在 1..100000"}, status_code=400)
+    if not 1 <= dwell <= 10:
+        return JSONResponse({"error": "bad_dwell", "detail": "dwell 需在 1..10"}, status_code=400)
+    sign = -1 if side == "bid" else 1
+    # 注入价位远离随机槽位（mid±10..200），驻留期间不会被随机行情改动/删除
+    price = source.mid + sign * TICK * 25
+    scratch = source.mid - TICK * 30  # 驻留期的无害变更位（剧本增量必须非空）
+    plan: list[list[dict]] = [[{"side": side, "price": price, "qty": qty}]]
+    for i in range(dwell - 1):
+        plan.append([{"side": "bid", "price": scratch, "qty": 5 + (i % 2)}])
+    plan.append([{"side": side, "price": price, "qty": 0}])
+    source.scripted.extend(plan)
+    return {
+        "ok": True,
+        "side": side,
+        "price": price,
+        "qty": qty,
+        "dwell": dwell,
+        "increments": len(plan),
+        "hint": f"约 {len(plan) * source.tick_interval + 1:.1f}s 后到采集器 GET /events/short-dwell 复核",
+    }

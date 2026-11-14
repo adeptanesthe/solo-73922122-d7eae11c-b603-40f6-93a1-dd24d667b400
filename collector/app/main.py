@@ -1,15 +1,16 @@
 """铜期货盘口采集器 API。
 
-- GET /book    已同步时返回序号 + 按价排序的买卖盘口；失步返回 503
-- GET /status  任意时刻可用：同步状态、序号、世代、统计计数
-- GET /docs    Swagger UI 在线查看/调用
+- GET /book                已同步时返回序号 + 按价排序的买卖盘口；失步返回 503
+- GET /status              任意时刻可用：同步状态、序号、世代、统计计数
+- GET /events/short-dwell  最近 100 条短驻留大额挂单事件（新的在前，失步也可查）
+- GET /docs                Swagger UI 在线查看/调用
 """
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
 from .config import Settings
@@ -43,7 +44,12 @@ async def index() -> dict:
     return {
         "service": app.title,
         "symbol": settings.symbol,
-        "links": {"book": "/book", "status": "/status", "docs": "/docs"},
+        "links": {
+            "book": "/book",
+            "status": "/status",
+            "short_dwell_events": "/events/short-dwell",
+            "docs": "/docs",
+        },
     }
 
 
@@ -71,3 +77,21 @@ async def get_book():
 async def get_status() -> dict:
     async with manager.lock:
         return manager.status_view()
+
+
+@app.get(
+    "/events/short-dwell",
+    summary="查询最近的短驻留大额挂单事件",
+    responses={
+        200: {
+            "description": "最近 N 条事件（新的在前）。"
+            "事件 = 同侧某价位从无档变为 >=min_qty 手，"
+            "随后 max_dwell 条增量内归零且期间未改量；失步期间历史事件仍可查。"
+        }
+    },
+)
+async def get_short_dwell_events(
+    limit: int = Query(default=100, ge=1, le=1000, description="返回条数上限（不超过容量）"),
+) -> dict:
+    async with manager.lock:
+        return manager.short_dwell_view(limit)
